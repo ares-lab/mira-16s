@@ -1,0 +1,250 @@
+---
+title: "MIRA 16S - DADA2 Workflow"
+author: "Erik Clarke"
+date: "5/18/2018"
+output: 
+  html_document:
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE
+  )
+
+library(tidyverse)
+library(dada2)
+
+ROOT_DATA_FP <- "~/projects/M01_Shared_Data"
+ROOT_OUT_FP <- "~/projects/M01-01_MIRA_16S_DADA2/dada2_output"
+TRUNC_LEN <- c(150, 200)
+
+#' Returns the paths to the fastq files and output folders for a given MIRA run and lane.
+#' 
+#' @param root_data_fp the absolute path to the folder containing the runs
+#' @param root_out_fp the absolute path to the parent of the output folders
+#' @param run the run name (MIRA1, MIRA2, etc)
+#' @param lane the lane number (L001, L002)
+get_paths <- function(root_data_fp, root_out_fp, run, lane) {
+  
+  data_fp <- file.path(root_data_fp, run, lane)
+  out_fp <- file.path(root_out_fp, run, lane)
+  out_filt_fp <- file.path(out_fp, "filtered")
+  fwd_fastqs <- list.files(data_fp, pattern="1.fastq.gz")
+  rev_fastqs <- list.files(data_fp, pattern="2.fastq.gz")
+  
+  names(fwd_fastqs) <- str_remove(fwd_fastqs, "_1.fastq.gz")
+  names(rev_fastqs) <- str_remove(rev_fastqs, "_2.fastq.gz")
+  rev_fastqs <- rev_fastqs[match(names(rev_fastqs), names(fwd_fastqs))]
+  
+  stopifnot(length(fwd_fastqs) == length(rev_fastqs))
+  stopifnot(length(fwd_fastqs) > 0)
+  list(
+    data_fp = data_fp,
+    out_fp = out_fp,
+    out_filt_fp = out_filt_fp,
+    fwd_fastqs = fwd_fastqs,
+    rev_fastqs = rev_fastqs
+  )
+}
+
+dada2_quality_plots <- function(fastqs, seed=1) {
+  set.seed(seed)
+  choices <- sample(length(fastqs), 2)
+  dada2::plotQualityProfile(
+    file.path(fastqs[choices])) +
+    labs(caption=sprintf(
+      "Quality displayed from two samples chosen at random (seed=%d)", seed))
+}
+
+dada2_filter_trim <- function(paths, trunclen=TRUNC_LEN) {
+  with(paths, {
+    out <- dada2::filterAndTrim(
+      fwd = file.path(data_fp, fwd_fastqs), filt = file.path(out_filt_fp, fwd_fastqs),
+      rev = file.path(data_fp, rev_fastqs), filt.rev = file.path(out_filt_fp, rev_fastqs),
+      truncLen = TRUNC_LEN, maxN=0, maxEE=c(2,2), truncQ=2, rm.phix = TRUE, 
+      compress = TRUE, multithread = TRUE)
+    data.frame(out) %>%
+      mutate(sample = rownames(.)) %>%
+      mutate(loss = (reads.in-reads.out)/reads.in) %>%
+      filter(reads.in > 1000) %>%
+      arrange(desc(loss))
+  })
+}
+```
+
+# Run 1
+
+```{r}
+r1 <- get_paths(ROOT_DATA_FP, ROOT_OUT_FP, "MIRA1", "combined")
+
+## Plot read quality
+with(r1, {
+  (dada2_quality_plots(file.path(data_fp, fwd_fastqs)) + 
+    ggtitle("Forward read quality"))
+  (dada2_quality_plots(file.path(data_fp, rev_fastqs)) + 
+    ggtitle("Reverse read quality"))
+})
+```
+
+## Filter and trim
+```{r}
+dada2_filter_trim(r1)
+```
+
+### Learn errors, dereplicate, and call sequence variants
+```{r}
+r1 <- within(r1, {
+  fwd_filt_fastqs <- list.files(out_filt_fp, pattern="_1.fastq.gz", full.names=TRUE)
+  rev_filt_fastqs <- list.files(out_filt_fp, pattern="_2.fastq.gz", full.names=TRUE)
+    
+  names(fwd_filt_fastqs) <- str_remove(basename(fwd_filt_fastqs), "_1.fastq.gz")
+  names(rev_filt_fastqs) <- str_remove(basename(rev_filt_fastqs), "_2.fastq.gz")
+  rev_filt_fastqs <- rev_filt_fastqs[match(names(rev_filt_fastqs), names(fwd_filt_fastqs))]
+  
+  fwd_err <- dada2::learnErrors(fwd_filt_fastqs, multithread = TRUE)
+  rev_err <- dada2::learnErrors(rev_filt_fastqs, multithread = TRUE)
+})
+
+## Adopting the streaming strategy since this is actually too big to fit in memory
+r1 <- within(r1, {
+  mergers <- vector("list", length(names(fwd_filt_fastqs)))
+  names(mergers) <- names(fwd_filt_fastqs)
+  for (sample in names(fwd_filt_fastqs)) {
+    cat("Processing:", sample, "\n")
+    derepF <- derepFastq(fwd_filt_fastqs[[sample]])
+    ddF <- dada(derepF, err=fwd_err, multithread = TRUE)
+    derepR <- derepFastq(rev_filt_fastqs[[sample]])
+    ddR <- dada(derepR, err=rev_err, multithread = TRUE)
+    merger <- mergePairs(ddF, derepF, ddR, derepR)
+    mergers[[sample]] <- merger
+  }
+  rm(derepF)
+  rm(derepR)
+  seqtab <- makeSequenceTable(mergers)
+  rownames(seqtab) <- paste0(rownames(seqtab), "_M1")
+  saveRDS(seqtab, file.path(out_fp, "seqtab.rds"))
+})
+```
+
+# Run 2
+```{r}
+r2 <- get_paths(ROOT_DATA_FP, ROOT_OUT_FP, "MIRA2", "combined")
+
+## Plot read quality
+with(r2, {
+  (dada2_quality_plots(file.path(data_fp, fwd_fastqs)) + 
+    ggtitle("Forward read quality"))
+  (dada2_quality_plots(file.path(data_fp, rev_fastqs)) + 
+    ggtitle("Reverse read quality"))
+})10
+```
+
+## Filter and trim
+```{r}
+dada2_filter_trim(r2)
+```
+
+### Learn errors, dereplicate, and call sequence variants
+```{r}
+r2 <- within(r2, {
+  fwd_filt_fastqs <- list.files(out_filt_fp, pattern="_1.fastq.gz", full.names=TRUE)
+  rev_filt_fastqs <- list.files(out_filt_fp, pattern="_2.fastq.gz", full.names=TRUE)
+    
+  names(fwd_filt_fastqs) <- str_remove(basename(fwd_filt_fastqs), "_1.fastq.gz")
+  names(rev_filt_fastqs) <- str_remove(basename(rev_filt_fastqs), "_2.fastq.gz")
+  rev_filt_fastqs <- rev_filt_fastqs[match(names(rev_filt_fastqs), names(fwd_filt_fastqs))]
+  
+  fwd_err <- dada2::learnErrors(fwd_filt_fastqs, multithread = TRUE)
+  rev_err <- dada2::learnErrors(rev_filt_fastqs, multithread = TRUE)
+})
+
+## Adopting the streaming strategy since this is actually too big to fit in memory
+r2 <- within(r2, {
+  mergers <- vector("list", length(names(fwd_filt_fastqs)))
+  names(mergers) <- names(fwd_filt_fastqs)
+  for (sample in names(fwd_filt_fastqs)) {
+    cat("Processing:", sample, "\n")
+    derepF <- derepFastq(fwd_filt_fastqs[[sample]])
+    ddF <- dada(derepF, err=fwd_err, multithread = TRUE)
+    derepR <- derepFastq(rev_filt_fastqs[[sample]])
+    ddR <- dada(derepR, err=rev_err, multithread = TRUE)
+    merger <- mergePairs(ddF, derepF, ddR, derepR)
+    mergers[[sample]] <- merger
+  }
+  rm(derepF)
+  rm(derepR)
+  seqtab <- makeSequenceTable(mergers)
+  rownames(seqtab) <- paste0(rownames(seqtab), "_M2")
+  saveRDS(seqtab, file.path(out_fp, "seqtab.rds"))
+})
+```
+
+# Run 3
+```{r}
+r3 <- get_paths(ROOT_DATA_FP, ROOT_OUT_FP, "MIRA3", "combined")
+
+## Plot read quality
+with(r3, {
+  (dada2_quality_plots(file.path(data_fp, fwd_fastqs)) + 
+    ggtitle("Forward read quality"))
+  (dada2_quality_plots(file.path(data_fp, rev_fastqs)) + 
+    ggtitle("Reverse read quality"))
+})
+```
+
+## Filter and trim
+```{r}
+dada2_filter_trim(r3)
+```
+
+### Learn errors, dereplicate, and call sequence variants
+```{r}
+r3 <- within(r3, {
+  fwd_filt_fastqs <- list.files(out_filt_fp, pattern="_1.fastq.gz", full.names=TRUE)
+  rev_filt_fastqs <- list.files(out_filt_fp, pattern="_2.fastq.gz", full.names=TRUE)
+    
+  names(fwd_filt_fastqs) <- str_remove(basename(fwd_filt_fastqs), "_1.fastq.gz")
+  names(rev_filt_fastqs) <- str_remove(basename(rev_filt_fastqs), "_2.fastq.gz")
+  rev_filt_fastqs <- rev_filt_fastqs[match(names(rev_filt_fastqs), names(fwd_filt_fastqs))]
+  
+  fwd_err <- dada2::learnErrors(fwd_filt_fastqs, multithread = TRUE)
+  rev_err <- dada2::learnErrors(rev_filt_fastqs, multithread = TRUE)
+})
+
+## Adopting the streaming strategy since this is actually too big to fit in memory
+r3 <- within(r3, {
+  mergers <- vector("list", length(names(fwd_filt_fastqs)))
+  names(mergers) <- names(fwd_filt_fastqs)
+  for (sample in names(fwd_filt_fastqs)) {
+    cat("Processing:", sample, "\n")
+    derepF <- derepFastq(fwd_filt_fastqs[[sample]])
+    ddF <- dada(derepF, err=fwd_err, multithread = TRUE)
+    derepR <- derepFastq(rev_filt_fastqs[[sample]])
+    ddR <- dada(derepR, err=rev_err, multithread = TRUE)
+    merger <- mergePairs(ddF, derepF, ddR, derepR)
+    mergers[[sample]] <- merger
+  }
+  rm(derepF)
+  rm(derepR)
+  seqtab <- makeSequenceTable(mergers)
+  rownames(seqtab) <- paste0(rownames(seqtab), "_M3")
+  saveRDS(seqtab, file.path(out_fp, "seqtab.rds"))
+})
+```
+
+# Merge Runs
+
+```{r}
+merged <- mergeSequenceTables(r1$seqtab, r2$seqtab, r3$seqtab)
+seqtab <- removeBimeraDenovo(merged, method="consensus", multithread=TRUE)
+taxa <- assignTaxonomy(seqtab, file.path(ROOT_DATA_FP, "silva_nr_v132_train_set.fa"), multithread = TRUE)
+taxa <- addSpecies(taxa, file.path(ROOT_DATA_FP, "silva_species_assignment_v132.fa"))
+saveRDS(seqtab, file.path(ROOT_OUT_FP, "seqtab.rds"))
+saveRDS(taxa, file.path(ROOT_OUT_FP, "taxa.rds"))
+```
+
