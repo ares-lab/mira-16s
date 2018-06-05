@@ -1,0 +1,151 @@
+---
+title: "MIRA 16S Preliminary Analysis (DADA2)"
+author: "Erik Clarke"
+date: "6/1/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  results="hide",
+  warning=FALSE,
+  message = FALSE,
+  fig.width=5,
+  fig.height = 3)
+
+library(tidyverse)
+library(dada2)
+
+ROOT_DATA_FP <- "~/projects/M01_Shared_Data"
+ROOT_OUT_FP <- "~/projects/M01-01_MIRA_16S_DADA2/dada2_output"
+FIG_FP <- "~/projects/M01-01_MIRA_16S_DADA2/Figures"
+
+mira_theme <- theme_bw() + theme(
+  strip.background = element_rect(fill = NA)
+)
+theme_set(mira_theme)
+```
+
+```{r load-data}
+load_all_data <- function() {
+  seqtab <- readRDS(file.path(ROOT_OUT_FP, "seqtab.rds"))
+  taxa <- readRDS(file.path(ROOT_OUT_FP, "taxa.rds"))
+  
+  r1.map <- qiimer::read_qiime_mapping_file(
+    file.path(ROOT_DATA_FP, "MIRA1/20171110_kelly_mira_mapping_file.txt")) %>%
+    select(specimen_id=SampleID, specimen_type=SampleType, flow_cell_id) %>%
+    mutate(specimen_id2 = paste0(specimen_id, "_M1"))
+  r2.map <- qiimer::read_qiime_mapping_file(
+    file.path(ROOT_DATA_FP, "MIRA2/kelly_mira2_mapping_file.tsv")) %>%
+    select(specimen_id=SampleID, specimen_type=SampleType, flow_cell_id) %>%
+    mutate(specimen_id2 = paste0(specimen_id, "_M2"))
+  r3.map <- qiimer::read_qiime_mapping_file(
+    file.path(ROOT_DATA_FP, "MIRA3/20180228_kelly_mira3_mapping_file.txt")) %>%
+    select(specimen_id=SampleID, specimen_type=SampleType, flow_cell_id) %>%
+    mutate(specimen_id2 = paste0(specimen_id, "_M3"))
+  mapped.samples <- bind_rows(r1.map, r2.map, r3.map) %>%
+    mutate(specimen_id = str_replace_all(specimen_id, "\\.", "_"))
+  
+  labvantage <- readxl::read_excel(file.path(ROOT_DATA_FP, "mira_labvantage.xls")) %>%
+    select(
+      subject_id=`Ext Participant ID`, 
+      specimen_id=`Immediate Parent Sample ID`, 
+      orig_specimen_type=`Original Sample Type`,
+      collection_date=`Collection Date`) %>%
+    mutate(specimen_id = stringr::str_replace_all(specimen_id, "-", "_"))
+  
+  samples <- left_join(mapped.samples, labvantage) %>%
+    group_by(subject_id) %>%
+    mutate(study_day = as.integer(difftime(collection_date, min(collection_date), units="days")))
+  
+  otus <- data.frame(seq=colnames(seqtab)) %>% mutate(otu_id = seq_len(ncol(seqtab)))
+  colnames(seqtab) <- otus$otu_id
+  agg <- reshape2::melt(seqtab, varnames=c("specimen_id2", "otu_id"), value.name="read_count") %>%
+    left_join(samples)
+  
+  list(
+    otus=otus,
+    samples,
+    taxa=taxa,
+    agg=agg
+  )
+}
+
+mira <- load_all_data()
+
+```
+
+## Summary plots
+
+### Pileups by subjects
+
+The following plots show the number of ASVs common to any number of subjects. The first shows 
+all counts of ASVs in any number of subjects, while the second shows the number of ASVs common to
+ten or more subjects.
+
+```{r}
+invisible(within(mira, {
+  asvs_by_subject <- agg %>% 
+    select(otu_id, subject_id, study_day, specimen_type=orig_specimen_type, read_count) %>%
+    filter(read_count > 0) %>%
+    filter(specimen_type %in% c("Oral Swab", "Stool Swab", "Sputum")) %>%
+    group_by(otu_id, specimen_type) %>%
+    summarize(distinct_subjects = n_distinct(subject_id)) %>%
+    group_by(specimen_type, distinct_subjects) %>% 
+    summarize(distinct_otus = n_distinct(otu_id))
+  
+  p.asv_pileup_all <- ggplot(asvs_by_subject, aes(distinct_subjects, distinct_otus)) + geom_bar(stat="identity") +
+    facet_grid(~ specimen_type, scales="free_x", space="free") +
+    scale_y_continuous(limits=c(0, 8e3), expand=c(0,0)) +
+    labs(x="Unique subjects", y="Unique ASVs", title="Counts of ASVs in any number of subjects")
+  ggsave(p.asv_pileup_all, filename = file.path(FIG_FP, "ASV_Pileup_All.pdf"), width=5, height=3)
+  plot(p.asv_pileup_all)
+  p.asv_pileup_gt10 <- ggplot(
+    filter(asvs_by_subject, distinct_subjects > 10), 
+    aes(distinct_subjects, distinct_otus)) + geom_bar(stat="identity") +
+    facet_grid(. ~ specimen_type, scales="free_x", space="free") +
+    scale_y_continuous(limits=c(0,60), expand=c(0,0)) +
+    labs(x="Unique subjects", y="Unique ASVs", title="Counts of ASVs in more than 10 subjects")
+  ggsave(p.asv_pileup_gt10, filename = file.path(FIG_FP, "ASV_Pileup_10_Subjects.pdf"), width=5, height=3)
+  plot(p.asv_pileup_gt10)
+}))
+```
+
+### Pileups by earliest detection
+
+The next two plots show the number of ASVs according to their first detection date. The first plot
+includes day 0 (i.e. ASVs endogenous to the patient) while the next plot shows all ASVs that appear
+only after day 0 (i.e. potentially hospital-acquired).
+
+```{r}
+invisible(with(mira, {
+  asvs_by_day <- agg %>% 
+    select(otu_id, subject_id, study_day, specimen_type=orig_specimen_type, read_count) %>%
+    filter(read_count > 0) %>%
+    filter(specimen_type %in% c("Oral Swab", "Stool Swab", "Sputum")) %>%
+    group_by(otu_id, specimen_type) %>%
+    summarize(earliest_study_day = min(study_day)) %>%
+    mutate(earliest_study_day = ifelse(earliest_study_day > 200, 200, earliest_study_day)) %>%
+    group_by(earliest_study_day, specimen_type) %>%
+    summarize(count = n())
+  p.all_days <- ggplot(asvs_by_day, aes(earliest_study_day, count)) + 
+    geom_bar(stat="identity", fill="black") +
+    facet_grid(. ~ specimen_type, space="free", scales="free") +
+    scale_y_continuous(expand=c(0,0)) +
+    scale_x_continuous(limits=c(-1, 201), breaks = seq(0, 200, by=50), labels=c(0, 50, 100, 150, "200+")) + 
+    labs(y="Unique ASVs", x="Earliest study day", title="ASVs by earliest detection")
+  ggsave(p.all_days, file=file.path(FIG_FP, "ASV_Pileup_Earliest_Day.pdf"), width=5, height=3)
+  plot(p.all_days)
+  p.all_except_0 <- ggplot(filter(asvs_by_day, earliest_study_day > 0), aes(earliest_study_day, count)) + 
+    geom_bar(stat="identity") +
+    scale_y_continuous(expand=c(0,0)) +
+    scale_x_continuous(limits=c(0, 201), breaks = c(1, seq(50, 200, by=50)), labels=c(1,50,100,150, "200+")) + 
+    facet_grid(. ~ specimen_type, space="free", scales="free") +
+    labs(y="Unique ASVs", x="Earliest study day", title="ASVs by earliest detection (excluding day 0)")
+  ggsave(p.all_except_0, file=file.path(FIG_FP, "ASV_Pileup_Earliest_Day_Except_D0.pdf"), width=5, height=3)
+  plot(p.all_except_0)
+}))
+```
+
+
